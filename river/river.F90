@@ -61,7 +61,7 @@ module river_mod
 !-------
 
   use diag_manager_mod,    only : diag_axis_init, register_diag_field, register_static_field, send_data, diag_field_add_attribute
-  use time_manager_mod,    only : time_type, increment_time, get_time, date_to_string
+  use time_manager_mod,    only : time_type, increment_time, get_time
   use data_override_mod,   only : data_override
   use river_type_mod,      only : river_type, Leo_Mad_trios, NO_RIVER_FLAG
   use river_physics_mod,   only : river_physics_step, river_physics_init, river_impedes_lake, &
@@ -592,7 +592,6 @@ end subroutine print_river_tracer_data
 
 !  increment time
     River%Time = increment_time(River%Time, River%dt_fast, 0)
-    write(mpp_pe()+100, *) "Incrementing River Time:", date_to_string(River%Time), " dt_fast:", River%dt_fast
     n = n + 1
 !--- accumulate runoff ---------------------
     River%run_stor   = River%run_stor   + runoff
