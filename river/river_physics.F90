@@ -34,7 +34,7 @@ module river_physics_mod
   use constants_mod,   only : tfreeze, hlf, DENS_H2O
   use land_debug_mod,  only : set_current_point, is_watch_cell
   use land_data_mod,   only : log_version
-
+  use time_manager_mod, only: date_to_string
   implicit none
   private
 
@@ -161,10 +161,10 @@ contains
     ! ---- register diagnostic fields
     id_ice  = register_diag_field ( 'river', 'rv_ice', (/id_lon, id_lat/), &
          River%Time, 'river ice mass fraction', '-', missing_value=missing, &
-         mask_variant=.TRUE. )
+         mask_variant=.TRUE., multiple_send_data=.True. )
     id_temp = register_diag_field ( 'river', 'rv_T', (/id_lon, id_lat/), &
          River%Time, 'river temperature', 'K', missing_value=missing, &
-         mask_variant=.TRUE. )
+         mask_variant=.TRUE., multiple_send_data=.True. )
   end subroutine river_physics_init
 
 !#####################################################################
@@ -530,6 +530,7 @@ contains
 
     if (cur_travel .gt. 0) call do_halo_update(River, halo_update(cur_travel))
 
+    write(mpp_pe()+100, *) "River%Time at the send data call:", date_to_string(River%Time)
     ! ---- diagnostic section
     if (id_ice > 0) used = send_data (id_ice, &
          ice(isc:iec,jsc:jec), River%Time, mask=diag_mask)
