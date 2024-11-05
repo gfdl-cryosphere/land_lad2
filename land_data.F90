@@ -97,6 +97,7 @@ type :: land_data_type
         rough_heat     => NULL(),  & ! roughness length for tracers and heat, m
         rough_scale    => NULL()     ! topographic scaler for momentum drag, m
 
+
    real, pointer, dimension(:,:,:)   :: &  ! (grid index, tile, tracer)
         tr    => NULL()              ! tracers, including canopy air specific humidity
 
@@ -108,6 +109,17 @@ type :: land_data_type
      discharge_heat      => NULL(),  & ! sensible heat of discharge (0 C datum)
      discharge_snow      => NULL(),  & ! solid water flux from land to ocean
      discharge_snow_heat => NULL()     ! sensible heat of discharge_snow (0 C datum)
+
+   real, pointer, dimension(:,:) :: &
+     IS_adot_sg          => NULL(), &      ! surface mass flux to ice sheet, (kg m-2 s-1)
+     IS_mask_sg          => NULL()         ! ice sheet mask for passing mass fluxes via the coupler to MOM6
+     !IS_adot_heat     => NULL()     ! sensible heat of IS_adot (0 C datum)
+
+   real, pointer, dimension(:,:) :: &
+     IS_adot_ug          => NULL(), &      ! surface mass flux to ice sheet, (kg m-2 s-1)
+     IS_mask_ug          => NULL()         ! ice sheet mask for passing mass fluxes via the coupler to MOM6
+     !IS_adot_heat     => NULL()     ! sensible heat of IS_adot (0 C datum)
+
 
    logical, pointer, dimension(:,:):: &
         mask => NULL()          ! true if land
@@ -141,6 +153,7 @@ type :: land_state_type
    real, allocatable  :: sg_area(:,:)  ! land area per grid cell, m2
    real, allocatable  :: sg_cellarea(:,:)  ! grid cell area, m2
    real, allocatable  :: sg_landfrac(:,:)  ! fraction of land in the grid cell
+   real, allocatable  :: sg_ISfrac(:,:)  ! fraction of cell overlying an ice sheet
    real, allocatable  :: sg_lon (:,:), sg_lat (:,:) ! domain grid center coordinates, radian
    real, allocatable  :: sg_lonb(:,:), sg_latb(:,:) ! domain grid vertices, radian
 
@@ -167,6 +180,8 @@ type :: land_state_type
 
    type(domain2D) :: sg_domain ! structured grid domain
    type(domainUG) :: ug_domain ! unstructured grid domain
+
+   logical :: do_IS   ! If true, passing mass surface fluxes to an ice sheet model
 end type land_state_type
 
 
@@ -204,7 +219,7 @@ end subroutine log_version
 
 
 ! ============================================================================
-subroutine land_data_init(layout, io_layout, time, dt_fast, dt_slow, mask_table, npes_io_group)
+subroutine land_data_init(layout, io_layout, time, dt_fast, dt_slow, mask_table, npes_io_group, do_IS)
   integer, intent(inout) :: layout(2) ! layout of our domains
   integer, intent(inout) :: io_layout(2) ! layout for land model io
   type(time_type), intent(in) :: &
@@ -213,12 +228,13 @@ subroutine land_data_init(layout, io_layout, time, dt_fast, dt_slow, mask_table,
        dt_slow    ! slow time step
   character(len=*), intent(in) :: mask_table
   integer,          intent(in) :: npes_io_group
-
+  logical,  intent(in) , optional :: do_IS
   ! ---- local vars
   integer :: nlon, nlat ! size of global grid in lon and lat directions
   integer :: ntiles     ! number of tiles in the mosaic grid
   integer, allocatable :: tile_ids(:) ! mosaic tile IDs for the current PE
   integer :: outunit
+  logical :: IS_enabled
   logical :: mask_table_exist
   logical, allocatable :: maskmap(:,:,:)  ! A pointer to an array indicating which
                                           ! logical processors are actually used for
@@ -297,6 +313,10 @@ subroutine land_data_init(layout, io_layout, time, dt_fast, dt_slow, mask_table,
   allocate(lnd%sg_area    (lnd%is:lnd%ie,   lnd%js:lnd%je))
   allocate(lnd%sg_cellarea(lnd%is:lnd%ie,   lnd%js:lnd%je))
   allocate(lnd%sg_landfrac(lnd%is:lnd%ie,   lnd%js:lnd%je))
+  IS_enabled=.false.
+  if (PRESENT(do_IS)) IS_enabled = do_IS
+  lnd%do_IS=.false.;if (IS_enabled) lnd%do_IS=.true.
+  if (lnd%do_IS) allocate(lnd%sg_ISfrac(lnd%is:lnd%ie,   lnd%js:lnd%je))
 
   ! initialize coordinates
   call get_grid_cell_area    ('LND',lnd%sg_face,lnd%sg_cellarea, domain=lnd%sg_domain)

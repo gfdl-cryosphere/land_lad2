@@ -108,7 +108,8 @@ use mpp_domains_mod, only: mpp_get_UG_compute_domain
 use mpp_domains_mod, only: mpp_get_UG_domain_grid_index
 use diag_axis_mod,   only: diag_axis_add_attribute
 
-use fms2_io_mod, only: read_data
+use fms2_io_mod, only: read_data, get_mosaic_tile_file, open_file, &
+                       FmsNetcdfDomainFile_t, close_file
 
 implicit none
 private
@@ -144,6 +145,8 @@ logical :: give_stock_details              = .false.
 logical :: use_tfreeze_in_grnd_latent      = .false.
 logical :: use_atmos_T_for_precip_T        = .false.
 logical :: use_atmos_T_for_evap_T          = .false.
+logical, save :: IS_enabled                      = .false. ! If true, mass fluxes are passed to the
+                                                     ! coupler for use in a separate ice sheet model
 real    :: cpw = 1952.  ! specific heat of water vapor at constant pressure
 real    :: clw = 4218.  ! specific heat of water (liquid)
 real    :: csw = 2106.  ! specific heat of water (ice)
@@ -212,7 +215,8 @@ namelist /land_model_nml/ use_old_conservation_equations, &
                           use_coast_rough, coast_rough_mom, coast_rough_heat, &
                           max_coast_frac, use_coast_topo_rough, &
                           layout, io_layout, mask_table, &
-                          precip_warning_tol, npes_io_group, predefined_tiles
+                          precip_warning_tol, npes_io_group, predefined_tiles, &
+                          IS_enabled
 ! ---- end of namelist -------------------------------------------------------
 
 logical  :: module_is_initialized = .FALSE.
@@ -254,7 +258,6 @@ integer :: &
   id_fsw,      id_fswv,     id_fsws,     id_fswg,                          &
   id_flw,      id_flwv,     id_flws,     id_flwg,                          &
   id_sens,     id_sensv,    id_senss,    id_sensg,                         &
-!
   id_e_res_1,  id_e_res_2,  id_cd_m,     id_cd_t,                          &
   id_cellarea, id_landfrac,                                                &
   id_geolon_t, id_geolat_t,                                                &
@@ -368,7 +371,7 @@ subroutine land_model_init &
   call astronomy_init()
 
   ! initialize land state data, including grid geometry and processor decomposition
-  call land_data_init(layout, io_layout, time, dt_fast, dt_slow, mask_table,npes_io_group)
+  call land_data_init(layout, io_layout, time, dt_fast, dt_slow, mask_table,npes_io_group, IS_enabled)
 
   ! initialize land debug output
   call land_debug_init()
@@ -994,11 +997,16 @@ subroutine update_land_model_fast ( cplr2land, land2cplr )
 
   real, dimension(lnd%is:lnd%ie,lnd%js:lnd%je) :: runoff_sg
   real, dimension(lnd%is:lnd%ie,lnd%js:lnd%je,n_river_tracers) :: runoff_c_sg
+  real, dimension(lnd%is:lnd%ie,lnd%js:lnd%je) :: IS_adot_sg
+  !real, dimension(lnd%is:lnd%ie,lnd%js:lnd%je,n_river_tracers) :: IS_adot_c_sg
 
   real, dimension(lnd%ls:lnd%le) :: &
-       runoff            ! total (liquid+snow) runoff accumulated over tiles in cell
+       runoff, &            ! total (liquid+snow) runoff accumulated over tiles in cell
+       IS_adot, &              ! Ice sheet top mass flux boundary condition
+       IS_mask              ! Ice sheet mask
   real, dimension(lnd%ls:lnd%le,n_river_tracers) :: &
        runoff_c          ! runoff of tracers accumulated over tiles in cell (including ice and heat)
+       !IS_adot_c         ! Ice sheets currently do not include tracers
   logical :: used          ! return value of send_data diagnostics routine
   real, allocatable :: runoff_1d(:),runoff_snow_1d(:),runoff_heat_1d(:)
   integer :: i,j,k,l     ! lon, lat, and tile indices
@@ -1034,6 +1042,8 @@ subroutine update_land_model_fast ( cplr2land, land2cplr )
   ! clear the runoff values, for accumulation over the tiles
   runoff = 0 ; runoff_c = 0
 
+  IS_adot = 0
+
   ! Calculate groundwater and associated heat fluxes between tiles within each gridcell.
   call hlsp_hydrology_1(n_c_types)
 
@@ -1065,7 +1075,7 @@ subroutine update_land_model_fast ( cplr2land, land2cplr )
            ISa_dn_dir, ISa_dn_dif, cplr2land%lwdn_flux(l,k), &
            cplr2land%ustar(l,k), cplr2land%p_surf(l,k), cplr2land%drag_q(l,k), &
            phot_co2_overridden, phot_co2_data(l),&
-           runoff(l), runoff_c(l,:) &
+           runoff(l), runoff_c(l,:), IS_adot(l) &
         )
         ! some of the diagnostic variables are sent from here, purely for coding
         ! convenience: the compute domain-level 2d and 3d vars are generally not
@@ -1086,6 +1096,12 @@ subroutine update_land_model_fast ( cplr2land, land2cplr )
   runoff_sg = 0 ; runoff_c_sg = 0
   call mpp_pass_UG_to_SG(lnd%ug_domain, runoff,   runoff_sg  )
   call mpp_pass_UG_to_SG(lnd%ug_domain, runoff_c, runoff_c_sg)
+  !--- pass IS_adot from unstructured grid to structured grid.
+  if (IS_enabled) then
+    IS_adot_sg = 0
+    call mpp_pass_UG_to_SG(lnd%ug_domain, IS_adot,   IS_adot_sg  )
+    land2cplr%IS_adot_sg = IS_adot_sg
+  endif
 
   call get_watch_point(iwatch,jwatch,kwatch,face)
   if (face==lnd%sg_face.and.(lnd%is<=iwatch.and.iwatch<=lnd%ie).and.&
@@ -1221,7 +1237,7 @@ subroutine update_land_model_fast_0d(tile, l, k, land2cplr, &
    ISa_dn_dir, ISa_dn_dif, ILa_dn, &
    ustar, p_surf, drag_q, &
    phot_co2_overridden, phot_co2_data, &
-   runoff, runoff_c &
+   runoff, runoff_c, IS_adot &
    )
   type (land_tile_type), pointer :: tile
   type(land_data_type), intent(inout) :: land2cplr
@@ -1244,7 +1260,8 @@ subroutine update_land_model_fast_0d(tile, l, k, land2cplr, &
   real, intent(inout) :: &
        runoff, &   ! total runoff of H2O
        runoff_c(:) ! runoff of tracers (including ice/snow and heat)
-
+  real, intent(inout), optional :: &
+       IS_adot    ! mass flux to pass to ice sheet model
 
   ! ---- local constants
   ! indices of variables and equations for implicit time stepping solution :
@@ -1254,6 +1271,7 @@ subroutine update_land_model_fast_0d(tile, l, k, land2cplr, &
   real :: A(5,5),B0(5),B1(5),B2(5) ! implicit equation matrix and right-hand side vectors
   real :: A00(5,5),B10(5),B00(5) ! copy of the above, only for debugging
   integer :: indx(5) ! permutation vector
+  logical :: IS_present
   ! linearization coefficients of various fluxes between components of land
   ! surface scheme
   real :: &
@@ -1344,6 +1362,8 @@ subroutine update_land_model_fast_0d(tile, l, k, land2cplr, &
   i = lnd%i_index(l)
   j = lnd%j_index(l)
 
+  IS_present=.false.
+  if (PRESENT(IS_adot)) IS_present=.true.
   if(is_watch_point()) then
      write(*,*)
      call log_date('#### update_land_model_fast_0d begins:',lnd%time)
@@ -1853,6 +1873,11 @@ subroutine update_land_model_fast_0d(tile, l, k, land2cplr, &
           subs_DT, subs_M_imp, subs_evap, &
           subs_levap, subs_fevap, &
           subs_melt, subs_lrunf, subs_hlrunf, subs_Ttop, subs_Ctop )
+     if (IS_enabled.and.land2cplr%IS_mask_ug(l,1)>0.) then
+          IS_adot = IS_adot + (snow_frunf - subs_melt - subs_levap - subs_fevap)*tile%frac
+          snow_frunf = 0.
+     endif
+
      subs_frunf = 0.
      subs_hfrunf = 0.
      subs_tr_runf = 0.0
@@ -2967,6 +2992,7 @@ subroutine land_diag_init(clonb, clatb, clon, clat, time, domain, id_band, id_ug
   integer,intent(out)          :: id_band !<"band" axis id.
   integer,intent(out)          :: id_ug   !<Unstructured axis id.
 
+
   ! ---- local vars ----------------------------------------------------------
   integer :: nlon, nlat       ! sizes of respective axes
   integer             :: axes(1)        ! Array of axes for 1-D unstructured fields.
@@ -2976,6 +3002,7 @@ subroutine land_diag_init(clonb, clatb, clon, clat, time, domain, id_band, id_ug
   integer             :: id_lat, id_latb
   integer :: i
   character(32) :: name       ! tracer name
+
 
   ! Register the unstructured axis for the unstructured domain.
   call mpp_get_UG_compute_domain(domain, size=ug_dim_size)
@@ -3719,7 +3746,10 @@ subroutine realloc_land2cplr ( bnd )
 
   ! ---- local vars
   integer :: n_tiles
+  logical :: success
+  type(FmsNetcdfDomainFile_t) :: maskfileobj_IS
 
+  real, dimension(lnd%ls:lnd%le) :: IS_mask_ug
   call dealloc_land2cplr(bnd, dealloc_discharges=.FALSE.)
 
   bnd%domain = lnd%sg_domain
@@ -3776,6 +3806,22 @@ subroutine realloc_land2cplr ( bnd )
      bnd%discharge_snow_heat = 0.0
   endif
 
+  if (IS_enabled .and. .not.associated(bnd%IS_mask_sg)) then
+     allocate( bnd%IS_adot_sg          (lnd%is:lnd%ie, lnd%js:lnd%je) )
+     bnd%IS_adot_sg           = 0.0
+     allocate( bnd%IS_mask_sg          (lnd%is:lnd%ie, lnd%js:lnd%je) )
+     bnd%IS_mask_sg           = 0.0
+     allocate( bnd%IS_mask_ug          (lnd%ls:lnd%le,1) )
+     bnd%IS_mask_ug           = 0.0
+
+     success=open_file(maskfileobj_IS,'INPUT_lndXIS/land_mask.nc','read',lnd%sg_domain)
+     if (.not. success) call error_mesg('realloc_land2cplr','Error opening IS mask file',FATAL)
+     call read_data(maskfileobj_IS,'mask',bnd%IS_mask_sg)
+     call close_file(maskfileobj_IS)
+     call mpp_pass_SG_to_UG(lnd%ug_domain, bnd%IS_mask_sg,  IS_mask_ug  )
+     bnd%IS_mask_ug(:,1)=IS_mask_ug
+  endif
+
 end subroutine realloc_land2cplr
 
 ! ============================================================================
@@ -3809,7 +3855,13 @@ subroutine dealloc_land2cplr ( bnd, dealloc_discharges )
      __DEALLOC__( bnd%discharge_heat      )
      __DEALLOC__( bnd%discharge_snow      )
      __DEALLOC__( bnd%discharge_snow_heat )
+     if (IS_enabled) then
+       __DEALLOC__( bnd%IS_adot_sg )
+       __DEALLOC__( bnd%IS_mask_sg )
+       __DEALLOC__( bnd%IS_mask_ug )
+     endif
   end if
+
 
 end subroutine dealloc_land2cplr
 ! ============================================================================
@@ -4039,4 +4091,3 @@ DEFINE_TAG_ACCESSOR(soil)
 DEFINE_TAG_ACCESSOR(vegn)
 
 end module land_model_mod
-
