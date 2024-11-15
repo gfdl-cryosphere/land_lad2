@@ -145,7 +145,7 @@ logical :: give_stock_details              = .false.
 logical :: use_tfreeze_in_grnd_latent      = .false.
 logical :: use_atmos_T_for_precip_T        = .false.
 logical :: use_atmos_T_for_evap_T          = .false.
-logical, save :: IS_enabled                      = .false. ! If true, mass fluxes are passed to the
+logical, save :: IS_enabled                = .false. ! If true, mass fluxes are passed to the
                                                      ! coupler for use in a separate ice sheet model
 real    :: cpw = 1952.  ! specific heat of water vapor at constant pressure
 real    :: clw = 4218.  ! specific heat of water (liquid)
@@ -215,8 +215,7 @@ namelist /land_model_nml/ use_old_conservation_equations, &
                           use_coast_rough, coast_rough_mom, coast_rough_heat, &
                           max_coast_frac, use_coast_topo_rough, &
                           layout, io_layout, mask_table, &
-                          precip_warning_tol, npes_io_group, predefined_tiles, &
-                          IS_enabled
+                          precip_warning_tol, npes_io_group, predefined_tiles
 ! ---- end of namelist -------------------------------------------------------
 
 logical  :: module_is_initialized = .FALSE.
@@ -307,7 +306,7 @@ contains
 
 ! ============================================================================
 subroutine land_model_init &
-     (cplr2land, land2cplr, time_init, time, dt_fast, dt_slow)
+     (cplr2land, land2cplr, time_init, time, dt_fast, dt_slow, ice_sheet_enabled)
 ! initialize land model using grid description file as an input. This routine
 ! reads land grid boundaries and area of land from a grid description file
 
@@ -326,6 +325,7 @@ subroutine land_model_init &
   type(time_type), intent(in) :: time      ! current time
   type(time_type), intent(in) :: dt_fast   ! fast time step
   type(time_type), intent(in) :: dt_slow   ! slow time step
+  logical, intent(in), optional :: ice_sheet_enabled   ! enable ice sheet surface forcing
 
   ! ---- local vars ----------------------------------------------------------
   integer :: ncid, varid
@@ -346,6 +346,8 @@ subroutine land_model_init &
   integer :: landInitClock
 
   module_is_initialized = .TRUE.
+
+  if (PRESENT(ice_sheet_enabled)) IS_enabled=ice_sheet_enabled
 
   ! [1] print out version number
   call log_version (version, module_name, &
@@ -371,7 +373,7 @@ subroutine land_model_init &
   call astronomy_init()
 
   ! initialize land state data, including grid geometry and processor decomposition
-  call land_data_init(layout, io_layout, time, dt_fast, dt_slow, mask_table,npes_io_group, IS_enabled)
+  call land_data_init(layout, io_layout, time, dt_fast, dt_slow, mask_table,npes_io_group, do_IS=IS_enabled)
 
   ! initialize land debug output
   call land_debug_init()
@@ -1874,7 +1876,9 @@ subroutine update_land_model_fast_0d(tile, l, k, land2cplr, &
           subs_levap, subs_fevap, &
           subs_melt, subs_lrunf, subs_hlrunf, subs_Ttop, subs_Ctop )
      if (IS_enabled.and.land2cplr%IS_mask_ug(l,1)>0.) then
-          IS_adot = IS_adot + (snow_frunf - subs_melt - subs_levap - subs_fevap)*tile%frac
+          !IS_adot = IS_adot + (snow_frunf - subs_melt - subs_levap - subs_fevap)*tile%frac
+          IS_adot = IS_adot + (vegn_fprec + vegn_lprec - snow_lrunf - snow_levap - snow_fevap &
+                    - subs_melt - subs_levap - subs_fevap)*tile%frac
           snow_frunf = 0.
      endif
 
