@@ -1877,9 +1877,9 @@ subroutine update_land_model_fast_0d(tile, l, k, land2cplr, &
           subs_melt, subs_lrunf, subs_hlrunf, subs_Ttop, subs_Ctop )
      if (IS_enabled.and.land2cplr%IS_mask_ug(l,1)>0.) then
           !IS_adot = IS_adot + (snow_frunf - subs_melt - subs_levap - subs_fevap)*tile%frac
+          !snow_frunf = 0.
           IS_adot = IS_adot + (vegn_fprec + vegn_lprec - snow_lrunf - snow_levap - snow_fevap &
                     - subs_melt - subs_levap - subs_fevap)*tile%frac
-          snow_frunf = 0.
      endif
 
      subs_frunf = 0.
