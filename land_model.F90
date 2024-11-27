@@ -1273,7 +1273,6 @@ subroutine update_land_model_fast_0d(tile, l, k, land2cplr, &
   real :: A(5,5),B0(5),B1(5),B2(5) ! implicit equation matrix and right-hand side vectors
   real :: A00(5,5),B10(5),B00(5) ! copy of the above, only for debugging
   integer :: indx(5) ! permutation vector
-  logical :: IS_present
   ! linearization coefficients of various fluxes between components of land
   ! surface scheme
   real :: &
@@ -1364,8 +1363,6 @@ subroutine update_land_model_fast_0d(tile, l, k, land2cplr, &
   i = lnd%i_index(l)
   j = lnd%j_index(l)
 
-  IS_present=.false.
-  if (PRESENT(IS_adot)) IS_present=.true.
   if(is_watch_point()) then
      write(*,*)
      call log_date('#### update_land_model_fast_0d begins:',lnd%time)
@@ -1969,9 +1966,17 @@ subroutine update_land_model_fast_0d(tile, l, k, land2cplr, &
   runoff      = runoff      + (snow_frunf  + subs_lrunf  + snow_lrunf + subs_frunf)*tile%frac
   do tr = 1,n_river_tracers
      if (tr==i_river_heat) then
-        runoff_c(tr) = runoff_c(tr) + (snow_hfrunf + subs_hlrunf + snow_hlrunf + subs_hfrunf)*tile%frac
+        if (.not. (IS_enabled.and.land2cplr%IS_mask_ug(l,1)>0.)) then
+           runoff_c(tr) = runoff_c(tr) + (snow_hfrunf + subs_hlrunf + snow_hlrunf + subs_hfrunf)*tile%frac
+        else
+           runoff_c(tr) = runoff_c(tr) + (subs_hlrunf + snow_hlrunf)*tile%frac
+        endif
      else if (tr==i_river_ice) then
-        runoff_c(tr) = runoff_c(tr) + (snow_frunf + subs_frunf)*tile%frac
+        if (.not. (IS_enabled.and.land2cplr%IS_mask_ug(l,1)>0.)) then
+           runoff_c(tr) = runoff_c(tr) + (snow_frunf + subs_frunf)*tile%frac
+        else
+           runoff = runoff - (snow_frunf + subs_frunf)*tile%frac
+        endif
      else
         runoff_c(tr) = runoff_c(tr) + subs_tr_runf(tr) * tile%frac
      endif
