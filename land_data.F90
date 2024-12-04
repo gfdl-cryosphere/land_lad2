@@ -181,6 +181,7 @@ type :: land_state_type
    type(domain2D) :: sg_domain ! structured grid domain
    type(domainUG) :: ug_domain ! unstructured grid domain
 
+   logical :: do_calve  !If true, calving for ice sheets is not done by land
    logical :: do_IS   ! If true, passing mass surface fluxes to an ice sheet model
 end type land_state_type
 
@@ -219,7 +220,8 @@ end subroutine log_version
 
 
 ! ============================================================================
-subroutine land_data_init(layout, io_layout, time, dt_fast, dt_slow, mask_table, npes_io_group, do_IS)
+subroutine land_data_init(layout, io_layout, time, dt_fast, dt_slow, mask_table, npes_io_group, &
+      do_calve, do_IS)
   integer, intent(inout) :: layout(2) ! layout of our domains
   integer, intent(inout) :: io_layout(2) ! layout for land model io
   type(time_type), intent(in) :: &
@@ -228,12 +230,14 @@ subroutine land_data_init(layout, io_layout, time, dt_fast, dt_slow, mask_table,
        dt_slow    ! slow time step
   character(len=*), intent(in) :: mask_table
   integer,          intent(in) :: npes_io_group
+  logical,  intent(in) , optional :: do_calve
   logical,  intent(in) , optional :: do_IS
   ! ---- local vars
   integer :: nlon, nlat ! size of global grid in lon and lat directions
   integer :: ntiles     ! number of tiles in the mosaic grid
   integer, allocatable :: tile_ids(:) ! mosaic tile IDs for the current PE
   integer :: outunit
+  logical :: IS_calving
   logical :: IS_enabled
   logical :: mask_table_exist
   logical, allocatable :: maskmap(:,:,:)  ! A pointer to an array indicating which
@@ -313,10 +317,13 @@ subroutine land_data_init(layout, io_layout, time, dt_fast, dt_slow, mask_table,
   allocate(lnd%sg_area    (lnd%is:lnd%ie,   lnd%js:lnd%je))
   allocate(lnd%sg_cellarea(lnd%is:lnd%ie,   lnd%js:lnd%je))
   allocate(lnd%sg_landfrac(lnd%is:lnd%ie,   lnd%js:lnd%je))
+  IS_calving=.false.
+  if (PRESENT(do_calve)) IS_calving = do_calve
+  lnd%do_calve=.false.;if (IS_calving) lnd%do_calve=.true.
   IS_enabled=.false.
   if (PRESENT(do_IS)) IS_enabled = do_IS
   lnd%do_IS=.false.;if (IS_enabled) lnd%do_IS=.true.
-  if (lnd%do_IS) allocate(lnd%sg_ISfrac(lnd%is:lnd%ie,   lnd%js:lnd%je))
+  if (lnd%do_IS.or.lnd%do_calve) allocate(lnd%sg_ISfrac(lnd%is:lnd%ie,   lnd%js:lnd%je))
 
   ! initialize coordinates
   call get_grid_cell_area    ('LND',lnd%sg_face,lnd%sg_cellarea, domain=lnd%sg_domain)

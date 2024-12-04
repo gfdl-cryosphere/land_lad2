@@ -145,6 +145,8 @@ logical :: give_stock_details              = .false.
 logical :: use_tfreeze_in_grnd_latent      = .false.
 logical :: use_atmos_T_for_precip_T        = .false.
 logical :: use_atmos_T_for_evap_T          = .false.
+logical, save :: IS_calving                = .false. ! If true, the ice shelves are in charge of
+                                                     ! ice sheet calving
 logical, save :: IS_enabled                = .false. ! If true, mass fluxes are passed to the
                                                      ! coupler for use in a separate ice sheet model
 real    :: cpw = 1952.  ! specific heat of water vapor at constant pressure
@@ -306,7 +308,8 @@ contains
 
 ! ============================================================================
 subroutine land_model_init &
-     (cplr2land, land2cplr, time_init, time, dt_fast, dt_slow, ice_sheet_enabled)
+     (cplr2land, land2cplr, time_init, time, dt_fast, dt_slow, ice_sheet_calving, &
+     ice_sheet_enabled)
 ! initialize land model using grid description file as an input. This routine
 ! reads land grid boundaries and area of land from a grid description file
 
@@ -325,6 +328,7 @@ subroutine land_model_init &
   type(time_type), intent(in) :: time      ! current time
   type(time_type), intent(in) :: dt_fast   ! fast time step
   type(time_type), intent(in) :: dt_slow   ! slow time step
+  logical, intent(in), optional :: ice_sheet_calving   ! enable ice sheet calving
   logical, intent(in), optional :: ice_sheet_enabled   ! enable ice sheet surface forcing
 
   ! ---- local vars ----------------------------------------------------------
@@ -347,6 +351,7 @@ subroutine land_model_init &
 
   module_is_initialized = .TRUE.
 
+  if (PRESENT(ice_sheet_calving)) IS_calving=ice_sheet_calving
   if (PRESENT(ice_sheet_enabled)) IS_enabled=ice_sheet_enabled
 
   ! [1] print out version number
@@ -373,7 +378,8 @@ subroutine land_model_init &
   call astronomy_init()
 
   ! initialize land state data, including grid geometry and processor decomposition
-  call land_data_init(layout, io_layout, time, dt_fast, dt_slow, mask_table,npes_io_group, do_IS=IS_enabled)
+  call land_data_init(layout, io_layout, time, dt_fast, dt_slow, mask_table,npes_io_group, &
+     do_calve=IS_calving, do_IS=IS_enabled)
 
   ! initialize land debug output
   call land_debug_init()
@@ -1966,13 +1972,13 @@ subroutine update_land_model_fast_0d(tile, l, k, land2cplr, &
   runoff      = runoff      + (snow_frunf  + subs_lrunf  + snow_lrunf + subs_frunf)*tile%frac
   do tr = 1,n_river_tracers
      if (tr==i_river_heat) then
-        if (.not. (IS_enabled.and.land2cplr%IS_mask_ug(l,1)>0.)) then
+        if (.not. ((IS_enabled.or.IS_calving).and.land2cplr%IS_mask_ug(l,1)>0.)) then
            runoff_c(tr) = runoff_c(tr) + (snow_hfrunf + subs_hlrunf + snow_hlrunf + subs_hfrunf)*tile%frac
         else
            runoff_c(tr) = runoff_c(tr) + (subs_hlrunf + snow_hlrunf)*tile%frac
         endif
      else if (tr==i_river_ice) then
-        if (.not. (IS_enabled.and.land2cplr%IS_mask_ug(l,1)>0.)) then
+        if (.not. ((IS_enabled.or.IS_calving).and.land2cplr%IS_mask_ug(l,1)>0.)) then
            runoff_c(tr) = runoff_c(tr) + (snow_frunf + subs_frunf)*tile%frac
         else
            runoff = runoff - (snow_frunf + subs_frunf)*tile%frac
@@ -3822,7 +3828,16 @@ subroutine realloc_land2cplr ( bnd )
      bnd%IS_mask_sg           = 0.0
      allocate( bnd%IS_mask_ug          (lnd%ls:lnd%le,1) )
      bnd%IS_mask_ug           = 0.0
+  endif
 
+  if (IS_calving .and. .not.associated(bnd%IS_mask_sg)) then
+     allocate( bnd%IS_mask_sg          (lnd%is:lnd%ie, lnd%js:lnd%je) )
+     bnd%IS_mask_sg           = 0.0
+     allocate( bnd%IS_mask_ug          (lnd%ls:lnd%le,1) )
+     bnd%IS_mask_ug           = 0.0
+  endif
+
+  if (IS_enabled .or. IS_calving) then
      success=open_file(maskfileobj_IS,'INPUT_lndXIS/land_mask.nc','read',lnd%sg_domain)
      if (.not. success) call error_mesg('realloc_land2cplr','Error opening IS mask file',FATAL)
      call read_data(maskfileobj_IS,'mask',bnd%IS_mask_sg)
@@ -3864,8 +3879,10 @@ subroutine dealloc_land2cplr ( bnd, dealloc_discharges )
      __DEALLOC__( bnd%discharge_heat      )
      __DEALLOC__( bnd%discharge_snow      )
      __DEALLOC__( bnd%discharge_snow_heat )
-     if (IS_enabled) then
-       __DEALLOC__( bnd%IS_adot_sg )
+     if (IS_enabled.or.IS_calving) then
+       if (IS_enabled) then
+          __DEALLOC__( bnd%IS_adot_sg )
+       endif
        __DEALLOC__( bnd%IS_mask_sg )
        __DEALLOC__( bnd%IS_mask_ug )
      endif
