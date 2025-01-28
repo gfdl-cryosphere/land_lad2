@@ -96,6 +96,7 @@ type :: glac_tile_type
    real, allocatable :: T(:)
    real, allocatable :: w_fc(:)
    real, allocatable :: w_wilt(:)
+   real :: IS_stock
    real :: Eg_part_ref
    real :: z0_scalar
    real :: geothermal_heat_flux
@@ -458,6 +459,9 @@ subroutine merge_glac_tiles(g1,w1,g2,w2)
     g2%T(i) = (HEAT1*x1+HEAT2*x2) / &
       (C2(i)*dz(i)+clw*g2%wl(i)+csw*g2%ws(i)) + tfreeze
   enddo
+
+  ! calculate (and assign) combined IS_stock
+  g2%IS_stock = g1%IS_stock*x1 + g2%IS_stock*x2
 
 end subroutine
 

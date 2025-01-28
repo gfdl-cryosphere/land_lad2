@@ -12,7 +12,7 @@ use time_manager_mod, only : time_type, get_time, increment_time, time_type_to_r
 use mpp_domains_mod, only : domain2d, mpp_get_ntile_count, mpp_pass_SG_to_UG, mpp_pass_ug_to_sg, &
                             mpp_get_UG_domain_tile_pe_inf, mpp_get_UG_domain_ntiles
 
-use mpp_mod, only : mpp_max, mpp_sum, mpp_chksum, MPP_FILL_INT, MPP_FILL_DOUBLE, input_nml_file
+use mpp_mod, only : mpp_max, mpp_min, mpp_sum, mpp_chksum, MPP_FILL_INT, MPP_FILL_DOUBLE, input_nml_file
 use fms_mod, only : error_mesg, FATAL, WARNING, NOTE, mpp_pe, &
      mpp_root_pe, check_nml_error, &
      stdlog, stderr, mpp_clock_id, mpp_clock_begin, mpp_clock_end, string, &
@@ -106,9 +106,11 @@ use predefined_tiles_mod, only: land_cover_cold_start_0d_predefined_tiles,&
 use mpp_domains_mod, only: domainUG
 use mpp_domains_mod, only: mpp_get_UG_compute_domain
 use mpp_domains_mod, only: mpp_get_UG_domain_grid_index
+use mpp_efp_mod,     only: mpp_reproducing_sum
 use diag_axis_mod,   only: diag_axis_add_attribute
 
-use fms2_io_mod, only: read_data, get_mosaic_tile_file, open_file, &
+use fms2_io_mod, only: read_data, get_mosaic_tile_file, open_file, register_axis, &
+                       register_field, get_variable_num_dimensions, get_variable_dimension_names, &
                        FmsNetcdfDomainFile_t, close_file
 
 implicit none
@@ -155,6 +157,7 @@ real    :: csw = 2106.  ! specific heat of water (ice)
 real    :: min_sum_lake_frac = 1.e-8
 real    :: min_frac = 0.0 ! minimum fraction of soil, lake, and glacier that is not discarded on cold start
 real    :: gfrac_tol         = 1.e-6
+real    :: IS_mask_tol       = 2.e-6
 real    :: discharge_tol = -1.e20
 real    :: con_fac_large = 1.e6
 real    :: con_fac_small = 1.e-6
@@ -203,6 +206,8 @@ logical :: use_coast_topo_rough = .true. ! if false, the topographic roughness s
                                       ! is not used over coastal points
 real    :: precip_warning_tol = -1.0e-18 ! if liquid or solid precip (input
            ! from atmos) is below this value, a warning is printed
+logical :: debug_adot  = .false. ! if true, print the global and hemisphere-specific area-integrated
+                                 ! ice-sheet surface mass flux, and the IS_stock
 
 namelist /land_model_nml/ use_old_conservation_equations, &
                           lm2, give_stock_details, &
@@ -210,13 +215,13 @@ namelist /land_model_nml/ use_old_conservation_equations, &
                           use_atmos_T_for_precip_T, &
                           use_atmos_T_for_evap_T, &
                           cpw, clw, csw, min_sum_lake_frac, min_frac, &
-                          gfrac_tol, discharge_tol, &
+                          gfrac_tol, IS_mask_tol, discharge_tol, &
                           con_fac_large, con_fac_small, &
                           tau_snow_T_adj, prohibit_negative_canopy_water, &
                           nearest_point_search, print_remapping, &
                           use_coast_rough, coast_rough_mom, coast_rough_heat, &
                           max_coast_frac, use_coast_topo_rough, &
-                          layout, io_layout, mask_table, &
+                          layout, io_layout, mask_table, debug_adot, &
                           precip_warning_tol, npes_io_group, predefined_tiles
 ! ---- end of namelist -------------------------------------------------------
 
@@ -338,6 +343,11 @@ subroutine land_model_init &
   integer :: id_ug !<Unstructured axis id.
   logical :: used                        ! return value of send_data diagnostics routine
   integer :: i,j,k,l
+  integer :: count_glac  !number of unstructured grid cells with glacier tile and ice sheet
+  integer :: count_nglac !number of unstructured grid cells with ice sheet but not glacier
+  integer :: count_glac_frac  !number of unstructured grid cells with glacier frac < ice sheet frac
+  real :: maxdiff,mindiff,nha,sha
+  real, allocatable :: sg_hemisphere_cell_area(:,:) ! grid cell area of one hemisphere
   type(land_tile_type), pointer :: tile
   type(land_tile_enum_type) :: ce
   integer :: ico2_atm ! index of CO2 tracer in the atmos, or NO_TRACER
@@ -345,6 +355,7 @@ subroutine land_model_init &
   type(land_restart_type) :: restart
   character(*), parameter :: restart_file_name='INPUT/land.nc'
   logical :: restart_exists
+  character(len=240) :: message
 
   ! IDs of local clocks
   integer :: landInitClock
@@ -502,15 +513,84 @@ subroutine land_model_init &
      call update_land_bc_fast (tile, l,k, land2cplr, is_init=.true.)
   enddo
 
+  ! Mark and count ice sheet cells that are properly associated with glacier tiles
+  ! Calculate initial ice sheet area
+  count_glac=0 ; count_glac_frac=0
+  do l = lnd%ls, lnd%le
+    i = lnd%i_index(l)
+    j = lnd%j_index(l)
+    call set_current_point(i,j,k,l)
+    ce = first_elmt(land_tile_map(l))
+    do while (loop_over_tiles(ce,tile,k=k))
+      if (associated(tile%glac) .and. land2cplr%IS_mask_ug(l,1)>0) then
+        if (tile%frac>0) then
+          land2cplr%IS_mask_ug(l,1) = -land2cplr%IS_mask_ug(l,1)
+          count_glac=count_glac+1
+        endif
+        if (tile%frac<land2cplr%IS_mask_ug(l,1)*lnd%ug_cellarea(l)/lnd%ug_area(l)) then
+          count_glac_frac=count_glac_frac+1
+        endif
+      endif
+    enddo
+  enddo
+
+  call mpp_sum(count_glac_frac,pelist=lnd%pelist)
+  call mpp_sum(count_glac,pelist=lnd%pelist)
+
   ! [8.4] update topographic roughness scaling
   call update_land_bc_slow( land2cplr )
 
   ! mask error checking
+
+  count_nglac=0
+  mindiff=huge(1.0)
+  maxdiff=0
   do l=lnd%ls,lnd%le
+    ! Count ice sheet cells that are not associated with glacier tiles
+    if (land2cplr%IS_mask_ug(l,1)>0) then
+      count_nglac=count_nglac+1
+      maxdiff = max(maxdiff,land2cplr%IS_mask_ug(l,1))
+      mindiff = min(mindiff,land2cplr%IS_mask_ug(l,1))
+    endif
      if(lnd%ug_landfrac(l)>0.neqv.ANY(land2cplr%mask(l,:))) then
         call error_mesg('land_model_init','land masks from grid spec and from land restart do not match',FATAL)
      endif
   enddo
+
+  call mpp_sum(count_nglac,pelist=lnd%pelist); call mpp_max(maxdiff,pelist=lnd%pelist)
+  call mpp_min(mindiff,pelist=lnd%pelist)
+  land2cplr%IS_mask_ug(:,1)=abs(land2cplr%IS_mask_ug(:,1))
+  write (message,*) &
+    count_nglac,'out of',count_glac+count_nglac,'ice sheet cells are NOT represented on glacier tiles!'
+  call error_mesg('land_model_init',message,NOTE)
+  write (message,*) &
+    'Ice sheet fractions neglected: min',mindiff,'max',maxdiff
+  call error_mesg('land_model_init',message,NOTE)
+  write (message,*) &
+    count_glac_frac,'cells have greater ice sheet fractions than glacier fractions!'
+  call error_mesg('land_model_init',message,NOTE)
+
+  ! Report ice sheet areas in the land model, for comparison with in MOM
+  allocate(sg_hemisphere_cell_area(size(lnd%sg_cellarea,1),size(lnd%sg_cellarea,2)))
+  where(lnd%sg_lat>=0)
+    sg_hemisphere_cell_area = lnd%sg_cellarea*land2cplr%IS_mask_sg
+  elsewhere
+    sg_hemisphere_cell_area = lnd%sg_cellarea*0
+  end where
+  nha = mpp_reproducing_sum(sg_hemisphere_cell_area)
+  write (message,*) 'Initial ice sheet area: Northern Hemisphere',nha
+  call error_mesg('land_model_init',message,NOTE)
+  where(lnd%sg_lat<0)
+    sg_hemisphere_cell_area = lnd%sg_cellarea*land2cplr%IS_mask_sg
+  elsewhere
+    sg_hemisphere_cell_area = lnd%sg_cellarea*0
+  end where
+  sha = mpp_reproducing_sum(sg_hemisphere_cell_area)
+  write (message,*) 'Initial ice sheet area: Southern Hemisphere',sha
+  call error_mesg('land_model_init',message,NOTE)
+  write (message,*) 'Initial ice sheet area: Total',nha+sha
+  call error_mesg('land_model_init',message,NOTE)
+  deallocate(sg_hemisphere_cell_area)
 
   ! [9] check the properties of co2 exchange with the atmosphere and set appropriate
   ! flags. Since co2 tracer is always present in the land tracer table, we use
@@ -983,9 +1063,10 @@ end subroutine land_cover_warm_start_new
 
 
 ! ============================================================================
-subroutine update_land_model_fast ( cplr2land, land2cplr )
+subroutine update_land_model_fast ( cplr2land, land2cplr, na)
   type(atmos_land_boundary_type), intent(in)    :: cplr2land
   type(land_data_type)          , intent(inout) :: land2cplr
+  integer, intent(in) :: na !< Current fast iteration
 
   ! ---- local vars
   real :: &
@@ -1005,12 +1086,15 @@ subroutine update_land_model_fast ( cplr2land, land2cplr )
 
   real, dimension(lnd%is:lnd%ie,lnd%js:lnd%je) :: runoff_sg
   real, dimension(lnd%is:lnd%ie,lnd%js:lnd%je,n_river_tracers) :: runoff_c_sg
-  real, dimension(lnd%is:lnd%ie,lnd%js:lnd%je) :: IS_adot_sg
+  real, dimension(lnd%is:lnd%ie,lnd%js:lnd%je) :: IS_adot_sg !kg m-2 s-1
+  real, dimension(lnd%ls:lnd%le) :: IS_mask_ug
+  real, dimension(lnd%is:lnd%ie,lnd%js:lnd%je) :: IS_mask_sg
+
   !real, dimension(lnd%is:lnd%ie,lnd%js:lnd%je,n_river_tracers) :: IS_adot_c_sg
 
   real, dimension(lnd%ls:lnd%le) :: &
        runoff, &            ! total (liquid+snow) runoff accumulated over tiles in cell
-       IS_adot, &              ! Ice sheet top mass flux boundary condition
+       IS_adot, &           ! Ice sheet top mass flux boundary condition per glacier area, kg m-2 s-1
        IS_mask              ! Ice sheet mask
   real, dimension(lnd%ls:lnd%le,n_river_tracers) :: &
        runoff_c          ! runoff of tracers accumulated over tiles in cell (including ice and heat)
@@ -1030,6 +1114,9 @@ subroutine update_land_model_fast ( cplr2land, land2cplr )
   integer           :: iwatch,jwatch,kwatch,face
 
   real :: twsr_sg(lnd%is:lnd%ie,lnd%js:lnd%je), tws(lnd%ls:lnd%le)
+  real, save :: adot_int_nh, adot_int_sh
+  integer :: ntot !Total number of fast interations per coupled time step
+  character(len=240) :: message
 
   ! start clocks
   call mpp_clock_begin(landClock)
@@ -1051,6 +1138,7 @@ subroutine update_land_model_fast ( cplr2land, land2cplr )
   runoff = 0 ; runoff_c = 0
 
   IS_adot = 0
+  ntot = int(time_type_to_real(lnd%dt_slow)/time_type_to_real(lnd%dt_fast))
 
   ! Calculate groundwater and associated heat fluxes between tiles within each gridcell.
   call hlsp_hydrology_1(n_c_types)
@@ -1058,7 +1146,8 @@ subroutine update_land_model_fast ( cplr2land, land2cplr )
   ! main tile loop
 !$OMP parallel do default(none) shared(lnd,land_tile_map,cplr2land,land2cplr,phot_co2_overridden, &
 !$OMP                                  phot_co2_data,runoff,runoff_c,id_area,id_z0m,id_z0s,       &
-!$OMP                                  id_Trad,id_Tca,id_qca,isphum,id_cd_m,id_cd_t,IS_adot) &
+!$OMP                                  id_Trad,id_Tca,id_qca,isphum,id_cd_m,id_cd_t,IS_adot,      &
+!$OMP                                  IS_enabled) &
 !$OMP                                  private(i1,i,j,k,ce,tile,ISa_dn_dir,ISa_dn_dif)
   do l = lnd%ls, lnd%le
      i = lnd%i_index(l)
@@ -1106,9 +1195,39 @@ subroutine update_land_model_fast ( cplr2land, land2cplr )
   call mpp_pass_UG_to_SG(lnd%ug_domain, runoff_c, runoff_c_sg)
   !--- pass IS_adot from unstructured grid to structured grid.
   if (IS_enabled) then
-    IS_adot_sg = 0
-    call mpp_pass_UG_to_SG(lnd%ug_domain, IS_adot,   IS_adot_sg  )
-    land2cplr%IS_adot_sg = IS_adot_sg
+     if (na==1) then
+       land2cplr%IS_adot_sg = 0.0
+       land2cplr%IS_adot_int = 0.0
+       adot_int_nh=0.0; adot_int_sh=0.0
+     endif
+     IS_adot_sg = 0
+
+     call mpp_pass_UG_to_SG(lnd%ug_domain, IS_adot,   IS_adot_sg  )
+     land2cplr%IS_adot_sg = land2cplr%IS_adot_sg + IS_adot_sg
+
+     if (na==ntot) then
+        land2cplr%IS_adot_sg = land2cplr%IS_adot_sg/ntot
+        land2cplr%IS_adot_int = mpp_reproducing_sum(land2cplr%IS_adot_sg * land2cplr%IS_mask_sg * lnd%sg_cellarea)
+
+        if (debug_adot) then
+          !N Hemisphere only
+          IS_adot_sg = land2cplr%IS_adot_sg
+          where(lnd%sg_lat<0) IS_adot_sg=0
+          adot_int_nh = mpp_reproducing_sum(IS_adot_sg * lnd%sg_cellarea * land2cplr%IS_mask_sg)
+
+          !S Hemisphere only
+          IS_adot_sg = land2cplr%IS_adot_sg
+          where(lnd%sg_lat>=0) IS_adot_sg=0
+          adot_int_sh = mpp_reproducing_sum(IS_adot_sg * lnd%sg_cellarea * land2cplr%IS_mask_sg)
+
+          write (message,*) 'Ice sheet area-int surface mass flux NH  :',adot_int_nh
+          call error_mesg('update_land_model_fast',message,NOTE)
+          write (message,*) 'Ice sheet area-int surface mass flux SH  :',adot_int_sh
+          call error_mesg('update_land_model_fast',message,NOTE)
+          write (message,*) 'Ice sheet area-int surface mass flux Tot :',land2cplr%IS_adot_int
+          call error_mesg('update_land_model_fast',message,NOTE)
+        endif
+     endif
   endif
 
   call get_watch_point(iwatch,jwatch,kwatch,face)
@@ -1268,8 +1387,8 @@ subroutine update_land_model_fast_0d(tile, l, k, land2cplr, &
   real, intent(inout) :: &
        runoff, &   ! total runoff of H2O
        runoff_c(:) ! runoff of tracers (including ice/snow and heat)
-  real, intent(inout), optional :: &
-       IS_adot    ! mass flux to pass to ice sheet model
+  real, intent(inout) :: &
+       IS_adot     ! mass flux to pass to ice sheet model, per glacier area, kg m-2 s-1
 
   ! ---- local constants
   ! indices of variables and equations for implicit time stepping solution :
@@ -1364,6 +1483,7 @@ subroutine update_land_model_fast_0d(tile, l, k, land2cplr, &
   real :: lswept, fswept, hlswept, hfswept ! amounts of liquid and frozen snow, and corresponding
                                            ! heat swept with tiny snow
   real :: grnd_latent ! specific heat of vaporization for the ground, for diag only
+  real :: IS_frac     ! fraction of land that is ice sheet
 
 
   i = lnd%i_index(l)
@@ -1873,16 +1993,30 @@ subroutine update_land_model_fast_0d(tile, l, k, land2cplr, &
      subs_G = 0
   endif
 
+  IS_frac=0
   if (associated(tile%glac)) then
      call glac_step_2 ( tile%glac, tile%diag, snow_lprec, snow_hlprec, &
           subs_DT, subs_M_imp, subs_evap, &
           subs_levap, subs_fevap, &
           subs_melt, subs_lrunf, subs_hlrunf, subs_Ttop, subs_Ctop )
-     if (IS_enabled.and.land2cplr%IS_mask_ug(l,1)>0.) then
-          !IS_adot = IS_adot + (snow_frunf - subs_melt - subs_levap - subs_fevap)*tile%frac
-          !snow_frunf = 0.
-          IS_adot = IS_adot + (vegn_fprec + vegn_lprec - snow_lrunf - snow_levap - snow_fevap &
-                    - subs_melt - subs_levap - subs_fevap)*tile%frac
+     if (IS_enabled) then
+       if (land2cplr%IS_mask_ug(l,1)>0.) then
+
+         !for testing
+         ! IS_adot = IS_adot + 1
+
+         IS_frac=land2cplr%IS_mask_ug(l,1)*lnd%ug_cellarea(l)/lnd%ug_area(l)
+         ! Do the units make sense here? Is this kg/s per area_glacier?
+         IS_adot = IS_adot + (vegn_fprec + vegn_lprec - snow_lrunf - snow_levap - snow_fevap &
+                   - subs_melt - subs_levap - subs_fevap)
+
+         ! Store the runoff on the ice sheet that will not enter the river, minus the adot that
+         ! will be sent to MOM. [kg]
+         tile%glac%IS_stock = tile%glac%IS_stock + (snow_frunf - &
+                                         (vegn_fprec + vegn_lprec - snow_lrunf - snow_levap - snow_fevap &
+                                         - subs_melt - subs_levap - subs_fevap)) * &
+                                         IS_frac * lnd%ug_area(l) * delta_time
+       endif
      endif
 
      subs_frunf = 0.
@@ -1969,24 +2103,38 @@ subroutine update_land_model_fast_0d(tile, l, k, land2cplr, &
   call update_land_bc_fast (tile, l, k, land2cplr)
 
   ! accumulate runoff variables over the tiles
-  runoff      = runoff      + (snow_frunf  + subs_lrunf  + snow_lrunf + subs_frunf)*tile%frac
+  ! runoff      = runoff      + (snow_frunf  + subs_lrunf  + snow_lrunf + subs_frunf)*tile%frac
+  ! do tr = 1,n_river_tracers
+  !    if (tr==i_river_heat) then
+  !       if (.not. ((IS_enabled.or.IS_calving).and.land2cplr%IS_mask_ug(l,1)>0.)) then
+  !          runoff_c(tr) = runoff_c(tr) + (snow_hfrunf + subs_hlrunf + snow_hlrunf + subs_hfrunf)*tile%frac
+  !       else
+  !          runoff_c(tr) = runoff_c(tr) + (subs_hlrunf + snow_hlrunf)*tile%frac
+  !       endif
+  !     else if (tr==i_river_ice) then
+  !       if (.not. ((IS_enabled.or.IS_calving).and.land2cplr%IS_mask_ug(l,1)>0.)) then
+  !          runoff_c(tr) = runoff_c(tr) + (snow_frunf + subs_frunf)*tile%frac
+  !       else
+  !          runoff = runoff - (snow_frunf + subs_frunf)*tile%frac
+  !       endif
+  !    else
+  !       runoff_c(tr) = runoff_c(tr) + subs_tr_runf(tr) * tile%frac
+  !    endif
+  ! enddo
+
+  ! accumulate runoff variables over the tiles
+  runoff = runoff + (snow_lrunf + subs_lrunf) * tile%frac + (snow_frunf + subs_frunf) * (tile%frac-IS_frac)
   do tr = 1,n_river_tracers
      if (tr==i_river_heat) then
-        if (.not. ((IS_enabled.or.IS_calving).and.land2cplr%IS_mask_ug(l,1)>0.)) then
-           runoff_c(tr) = runoff_c(tr) + (snow_hfrunf + subs_hlrunf + snow_hlrunf + subs_hfrunf)*tile%frac
-        else
-           runoff_c(tr) = runoff_c(tr) + (subs_hlrunf + snow_hlrunf)*tile%frac
-        endif
-     else if (tr==i_river_ice) then
-        if (.not. ((IS_enabled.or.IS_calving).and.land2cplr%IS_mask_ug(l,1)>0.)) then
-           runoff_c(tr) = runoff_c(tr) + (snow_frunf + subs_frunf)*tile%frac
-        else
-           runoff = runoff - (snow_frunf + subs_frunf)*tile%frac
-        endif
-     else
-        runoff_c(tr) = runoff_c(tr) + subs_tr_runf(tr) * tile%frac
-     endif
+        runoff_c(tr) = runoff_c(tr) + (snow_hlrunf + subs_hlrunf) * tile%frac  + &
+                                      (snow_hfrunf + subs_hfrunf) * (tile%frac-IS_frac)
+    else if (tr==i_river_ice) then
+       runoff_c(tr) = runoff_c(tr) + (snow_frunf + subs_frunf) * (tile%frac-IS_frac)
+    else
+       runoff_c(tr) = runoff_c(tr) + subs_tr_runf(tr) * tile%frac
+    endif
   enddo
+
   hprec = (clw*precip_l+csw*precip_s)*(precip_T-tfreeze)
   hevap = cpw*land_evap*(evap_T-tfreeze)
 
@@ -2818,7 +2966,7 @@ real twd_gas_cana,               twd_liq_glac, twd_sol_glac, &
 ! *_gcwd are grid-cell water densities (kg water per m2 of land in grid cell)
 real gcwd_cana, gcwd_glac, gcwd_lake, gcwd_soil, gcwd_snow, gcwd_vegn
 ! v_* are global masses of water
-real v_cana, v_glac, v_lake, v_soil, v_snow, v_vegn
+real v_cana, v_glac, v_lake, v_soil, v_snow, v_vegn, v_IS
 real cana_q, a_globe
 
 value = 0.0
@@ -2828,6 +2976,7 @@ v_lake = 0.
 v_soil = 0.
 v_snow = 0.
 v_vegn = 0.
+v_IS = 0.
 if(.not.bnd%pe) return
 ls = lnd%ls
 le = lnd%le
@@ -2855,8 +3004,10 @@ case(ISTOCK_WATER)
         call cana_state ( tile%cana, cana_q=cana_q )
         twd_gas_cana = canopy_air_mass*cana_q
         endif
-      if(associated(tile%glac)) &
+      if(associated(tile%glac)) then
         call glac_tile_stock_pe(tile%glac, twd_liq_glac, twd_sol_glac)
+        v_IS = v_IS + tile%glac%IS_stock
+      endif
       if(associated(tile%lake)) &
         call lake_tile_stock_pe(tile%lake, twd_liq_lake, twd_sol_lake)
       if(associated(tile%soil)) &
@@ -2879,7 +3030,15 @@ case(ISTOCK_WATER)
     v_snow = v_snow + gcwd_snow * lnd%ug_area(l)*area_factor
     v_vegn = v_vegn + gcwd_vegn * lnd%ug_area(l)*area_factor
   enddo
-  value  = v_cana + v_glac + v_lake + v_soil + v_snow + v_vegn
+  value  = v_cana + v_glac + v_lake + v_soil + v_snow + v_vegn + v_IS
+
+  call mpp_sum(v_IS, pelist=lnd%pelist)
+
+  if (debug_adot) then
+     write (message,*) 'IS stock  :',v_IS
+     call error_mesg('lnd',message,NOTE)
+  endif
+
 a_globe = 4. * pi * radius**2
 case(ISTOCK_HEAT)
   if(.not.stock_warning_issued) then
@@ -3760,11 +3919,13 @@ subroutine realloc_land2cplr ( bnd )
   type(land_data_type), intent(inout) :: bnd     ! data to allocate
 
   ! ---- local vars
-  integer :: n_tiles
+  integer :: n_tiles, ndims
   logical :: success
   type(FmsNetcdfDomainFile_t) :: maskfileobj_IS
 
   real, dimension(lnd%ls:lnd%le) :: IS_mask_ug
+  character(len=30), allocatable :: dimnames(:)  !< Array of dimension names
+
   call dealloc_land2cplr(bnd, dealloc_discharges=.FALSE.)
 
   bnd%domain = lnd%sg_domain
@@ -3821,29 +3982,33 @@ subroutine realloc_land2cplr ( bnd )
      bnd%discharge_snow_heat = 0.0
   endif
 
-  if (IS_enabled .and. .not.associated(bnd%IS_mask_sg)) then
-     allocate( bnd%IS_adot_sg          (lnd%is:lnd%ie, lnd%js:lnd%je) )
-     bnd%IS_adot_sg           = 0.0
-     allocate( bnd%IS_mask_sg          (lnd%is:lnd%ie, lnd%js:lnd%je) )
-     bnd%IS_mask_sg           = 0.0
-     allocate( bnd%IS_mask_ug          (lnd%ls:lnd%le,1) )
-     bnd%IS_mask_ug           = 0.0
-  endif
+  if ((IS_enabled .or. IS_calving) .and. (.not.associated(bnd%IS_mask_sg))) then
+    if (IS_enabled) then
+      allocate( bnd%IS_adot_sg          (lnd%is:lnd%ie, lnd%js:lnd%je) )
+      bnd%IS_adot_sg           = 0.0
+    endif
+    allocate( bnd%IS_mask_sg          (lnd%is:lnd%ie, lnd%js:lnd%je) )
+    bnd%IS_mask_sg           = 0.0
 
-  if (IS_calving .and. .not.associated(bnd%IS_mask_sg)) then
-     allocate( bnd%IS_mask_sg          (lnd%is:lnd%ie, lnd%js:lnd%je) )
-     bnd%IS_mask_sg           = 0.0
-     allocate( bnd%IS_mask_ug          (lnd%ls:lnd%le,1) )
-     bnd%IS_mask_ug           = 0.0
-  endif
+    allocate( bnd%IS_mask_ug          (lnd%ls:lnd%le,1) )
+    bnd%IS_mask_ug           = 0.0
 
-  if (IS_enabled .or. IS_calving) then
-     success=open_file(maskfileobj_IS,'INPUT_lndXIS/land_mask.nc','read',lnd%sg_domain)
-     if (.not. success) call error_mesg('realloc_land2cplr','Error opening IS mask file',FATAL)
-     call read_data(maskfileobj_IS,'mask',bnd%IS_mask_sg)
-     call close_file(maskfileobj_IS)
-     call mpp_pass_SG_to_UG(lnd%ug_domain, bnd%IS_mask_sg,  IS_mask_ug  )
-     bnd%IS_mask_ug(:,1)=IS_mask_ug
+    success=open_file(maskfileobj_IS,'./INPUT_lndXIS/land_mask.nc','read',lnd%sg_domain)
+    if (.not. success) call error_mesg('realloc_land2cplr','Error opening IS mask file',FATAL)
+
+    ndims = get_variable_num_dimensions(maskfileobj_IS, "mask")
+    allocate(dimnames(ndims))
+    call get_variable_dimension_names(maskfileobj_IS,"mask" , dimnames)
+    call register_axis(maskfileobj_IS, dimnames(1), "x")
+    call register_axis(maskfileobj_IS, dimnames(2), "y")
+    call register_field(maskfileobj_IS, "mask", "double", dimnames)
+    call read_data(maskfileobj_IS,'mask',bnd%IS_mask_sg)
+    call close_file(maskfileobj_IS)
+    !Reverse the mask
+    bnd%IS_mask_sg=1-bnd%IS_mask_sg
+    where(bnd%IS_mask_sg<IS_mask_tol) bnd%IS_mask_sg=0.
+    call mpp_pass_SG_to_UG(lnd%ug_domain, bnd%IS_mask_sg,  IS_mask_ug  )
+    bnd%IS_mask_ug(:,1)=IS_mask_ug
   endif
 
 end subroutine realloc_land2cplr
@@ -3880,11 +4045,11 @@ subroutine dealloc_land2cplr ( bnd, dealloc_discharges )
      __DEALLOC__( bnd%discharge_snow      )
      __DEALLOC__( bnd%discharge_snow_heat )
      if (IS_enabled.or.IS_calving) then
-       if (IS_enabled) then
-          __DEALLOC__( bnd%IS_adot_sg )
-       endif
-       __DEALLOC__( bnd%IS_mask_sg )
-       __DEALLOC__( bnd%IS_mask_ug )
+        if (IS_enabled) then
+           __DEALLOC__( bnd%IS_adot_sg )
+        endif
+        __DEALLOC__( bnd%IS_mask_sg )
+        __DEALLOC__( bnd%IS_mask_ug )
      endif
   end if
 

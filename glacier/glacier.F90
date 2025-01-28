@@ -21,7 +21,7 @@ use land_tile_diag_mod, only : register_tiled_diag_field, send_tile_data, diag_b
 use land_data_mod, only : lnd, log_version
 use land_tile_io_mod, only: land_restart_type, &
      init_land_restart, open_land_restart, save_land_restart, free_land_restart, &
-     add_restart_axis, add_tile_data, get_tile_data
+     add_restart_axis, add_tile_data, get_tile_data, field_exists
 use land_debug_mod, only : is_watch_point
 
 implicit none
@@ -124,6 +124,8 @@ subroutine glac_init (id_ug)
      call get_tile_data(restart, 'temp', 'zfull', glac_temp_ptr)
      call get_tile_data(restart, 'wl',   'zfull', glac_wl_ptr)
      call get_tile_data(restart, 'ws',   'zfull', glac_ws_ptr)
+     if (field_exists(restart, 'IS_stock')) &
+        call get_tile_data(restart, 'IS_stock', glac_IS_stock_ptr)
   else
      call error_mesg('glac_init',&
           'cold-starting glacier',&
@@ -139,6 +141,7 @@ subroutine glac_init (id_ug)
            tile%glac%wl(1:num_l) = 0
            tile%glac%ws(1:num_l) = init_w*dz(1:num_l)
         endif
+        tile%glac%IS_stock      = 0
         tile%glac%T             = init_temp
      enddo
   endif
@@ -193,6 +196,8 @@ subroutine save_glac_restart (tile_dim_length, timestamp)
   call add_tile_data(restart,'temp', 'zfull          ', glac_temp_ptr, longname='glacier temperature',  units='degrees_K')
   call add_tile_data(restart,'wl',   'zfull          ', glac_wl_ptr,   longname='liquid water content', units='kg/m2')
   call add_tile_data(restart,'ws',   'zfull          ', glac_ws_ptr,   longname='solid water content',  units='kg/m2')
+  call add_tile_data(restart,'IS_stock',                glac_IS_stock_ptr,   &
+                     longname='stock of ice sheet (static) runoff - adot',  units='kg')
 
   ! save performs io domain aggregation through mpp_io as with regular domain data
   call save_land_restart(restart)
@@ -853,5 +858,14 @@ subroutine glac_ws_ptr(tile, i, ptr)
       if(associated(tile%glac)) ptr => tile%glac%ws(i)
    endif
 end subroutine glac_ws_ptr
+
+subroutine glac_IS_stock_ptr(tile, ptr)
+   type(land_tile_type), pointer :: tile ! input
+   real                , pointer :: ptr  ! returned pointer to the data
+   ptr=>NULL()
+   if(associated(tile)) then
+      if(associated(tile%glac)) ptr => tile%glac%IS_stock
+   endif
+end subroutine glac_IS_stock_ptr
 
 end module glacier_mod
