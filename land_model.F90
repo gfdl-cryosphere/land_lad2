@@ -2002,9 +2002,6 @@ subroutine update_land_model_fast_0d(tile, l, k, land2cplr, &
      if (IS_enabled) then
        if (land2cplr%IS_mask_ug(l,1)>0.) then
 
-         !for testing
-         ! IS_adot = IS_adot + 1
-
          IS_frac=land2cplr%IS_mask_ug(l,1)*lnd%ug_cellarea(l)/lnd%ug_area(l)
          ! Do the units make sense here? Is this kg/s per area_glacier?
          IS_adot = IS_adot + (vegn_fprec + vegn_lprec - snow_lrunf - snow_levap - snow_fevap &
