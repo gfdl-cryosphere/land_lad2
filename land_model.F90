@@ -516,81 +516,85 @@ subroutine land_model_init &
   ! Mark and count ice sheet cells that are properly associated with glacier tiles
   ! Calculate initial ice sheet area
   count_glac=0 ; count_glac_frac=0
-  do l = lnd%ls, lnd%le
-    i = lnd%i_index(l)
-    j = lnd%j_index(l)
-    call set_current_point(i,j,k,l)
-    ce = first_elmt(land_tile_map(l))
-    do while (loop_over_tiles(ce,tile,k=k))
-      if (associated(tile%glac) .and. land2cplr%IS_mask_ug(l,1)>0) then
+  if (IS_enabled .or. IS_calving) then
+     do l = lnd%ls, lnd%le
+     i = lnd%i_index(l)
+     j = lnd%j_index(l)
+     call set_current_point(i,j,k,l)
+     ce = first_elmt(land_tile_map(l))
+     do while (loop_over_tiles(ce,tile,k=k))
+     if (associated(tile%glac) .and. land2cplr%IS_mask_ug(l,1)>0) then
         if (tile%frac>0) then
-          land2cplr%IS_mask_ug(l,1) = -land2cplr%IS_mask_ug(l,1)
-          count_glac=count_glac+1
+           land2cplr%IS_mask_ug(l,1) = -land2cplr%IS_mask_ug(l,1)
+           count_glac=count_glac+1
         endif
         if (tile%frac<land2cplr%IS_mask_ug(l,1)*lnd%ug_cellarea(l)/lnd%ug_area(l)) then
-          count_glac_frac=count_glac_frac+1
+           count_glac_frac=count_glac_frac+1
         endif
-      endif
-    enddo
-  enddo
+     endif
+     enddo
+     enddo
 
-  call mpp_sum(count_glac_frac,pelist=lnd%pelist)
-  call mpp_sum(count_glac,pelist=lnd%pelist)
+     call mpp_sum(count_glac_frac,pelist=lnd%pelist)
+     call mpp_sum(count_glac,pelist=lnd%pelist)
+
+  endif
 
   ! [8.4] update topographic roughness scaling
   call update_land_bc_slow( land2cplr )
 
   ! mask error checking
-
-  count_nglac=0
-  mindiff=huge(1.0)
-  maxdiff=0
-  do l=lnd%ls,lnd%le
-    ! Count ice sheet cells that are not associated with glacier tiles
-    if (land2cplr%IS_mask_ug(l,1)>0) then
-      count_nglac=count_nglac+1
-      maxdiff = max(maxdiff,land2cplr%IS_mask_ug(l,1))
-      mindiff = min(mindiff,land2cplr%IS_mask_ug(l,1))
-    endif
+  if (IS_enabled .or. IS_calving) then
+     count_nglac=0
+     mindiff=huge(1.0)
+     maxdiff=0
+     do l=lnd%ls,lnd%le
+     ! Count ice sheet cells that are not associated with glacier tiles
+     if (land2cplr%IS_mask_ug(l,1)>0) then
+        count_nglac=count_nglac+1
+        maxdiff = max(maxdiff,land2cplr%IS_mask_ug(l,1))
+        mindiff = min(mindiff,land2cplr%IS_mask_ug(l,1))
+     endif
      if(lnd%ug_landfrac(l)>0.neqv.ANY(land2cplr%mask(l,:))) then
         call error_mesg('land_model_init','land masks from grid spec and from land restart do not match',FATAL)
      endif
-  enddo
+     enddo
 
-  call mpp_sum(count_nglac,pelist=lnd%pelist); call mpp_max(maxdiff,pelist=lnd%pelist)
-  call mpp_min(mindiff,pelist=lnd%pelist)
-  land2cplr%IS_mask_ug(:,1)=abs(land2cplr%IS_mask_ug(:,1))
-  write (message,*) &
-    count_nglac,'out of',count_glac+count_nglac,'ice sheet cells are NOT represented on glacier tiles!'
-  call error_mesg('land_model_init',message,NOTE)
-  write (message,*) &
-    'Ice sheet fractions neglected: min',mindiff,'max',maxdiff
-  call error_mesg('land_model_init',message,NOTE)
-  write (message,*) &
-    count_glac_frac,'cells have greater ice sheet fractions than glacier fractions!'
-  call error_mesg('land_model_init',message,NOTE)
+     call mpp_sum(count_nglac,pelist=lnd%pelist); call mpp_max(maxdiff,pelist=lnd%pelist)
+     call mpp_min(mindiff,pelist=lnd%pelist)
+     land2cplr%IS_mask_ug(:,1)=abs(land2cplr%IS_mask_ug(:,1))
+     write (message,*) &
+        count_nglac,'out of',count_glac+count_nglac,'ice sheet cells are NOT represented on glacier tiles!'
+     call error_mesg('land_model_init',message,NOTE)
+     write (message,*) &
+        'Ice sheet fractions neglected: min',mindiff,'max',maxdiff
+     call error_mesg('land_model_init',message,NOTE)
+     write (message,*) &
+        count_glac_frac,'cells have greater ice sheet fractions than glacier fractions!'
+     call error_mesg('land_model_init',message,NOTE)
 
-  ! Report ice sheet areas in the land model, for comparison with in MOM
-  allocate(sg_hemisphere_cell_area(size(lnd%sg_cellarea,1),size(lnd%sg_cellarea,2)))
-  where(lnd%sg_lat>=0)
-    sg_hemisphere_cell_area = lnd%sg_cellarea*land2cplr%IS_mask_sg
-  elsewhere
-    sg_hemisphere_cell_area = lnd%sg_cellarea*0
-  end where
-  nha = mpp_reproducing_sum(sg_hemisphere_cell_area)
-  write (message,*) 'Initial ice sheet area: Northern Hemisphere',nha
-  call error_mesg('land_model_init',message,NOTE)
-  where(lnd%sg_lat<0)
-    sg_hemisphere_cell_area = lnd%sg_cellarea*land2cplr%IS_mask_sg
-  elsewhere
-    sg_hemisphere_cell_area = lnd%sg_cellarea*0
-  end where
-  sha = mpp_reproducing_sum(sg_hemisphere_cell_area)
-  write (message,*) 'Initial ice sheet area: Southern Hemisphere',sha
-  call error_mesg('land_model_init',message,NOTE)
-  write (message,*) 'Initial ice sheet area: Total',nha+sha
-  call error_mesg('land_model_init',message,NOTE)
-  deallocate(sg_hemisphere_cell_area)
+     ! Report ice sheet areas in the land model, for comparison with in MOM
+     allocate(sg_hemisphere_cell_area(size(lnd%sg_cellarea,1),size(lnd%sg_cellarea,2)))
+     where(lnd%sg_lat>=0)
+        sg_hemisphere_cell_area = lnd%sg_cellarea*land2cplr%IS_mask_sg
+     elsewhere
+        sg_hemisphere_cell_area = lnd%sg_cellarea*0
+     end where
+     nha = mpp_reproducing_sum(sg_hemisphere_cell_area)
+     write (message,*) 'Initial ice sheet area: Northern Hemisphere',nha
+     call error_mesg('land_model_init',message,NOTE)
+     where(lnd%sg_lat<0)
+        sg_hemisphere_cell_area = lnd%sg_cellarea*land2cplr%IS_mask_sg
+     elsewhere
+        sg_hemisphere_cell_area = lnd%sg_cellarea*0
+     end where
+     sha = mpp_reproducing_sum(sg_hemisphere_cell_area)
+     write (message,*) 'Initial ice sheet area: Southern Hemisphere',sha
+     call error_mesg('land_model_init',message,NOTE)
+     write (message,*) 'Initial ice sheet area: Total',nha+sha
+     call error_mesg('land_model_init',message,NOTE)
+     deallocate(sg_hemisphere_cell_area)
+  endif
 
   ! [9] check the properties of co2 exchange with the atmosphere and set appropriate
   ! flags. Since co2 tracer is always present in the land tracer table, we use
