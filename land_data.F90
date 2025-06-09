@@ -158,7 +158,7 @@ type :: land_state_type
 
    ! geometry on unstructured grid
    real, allocatable  :: ug_area(:)      ! land area per grid cell, m2
-   real, allocatable  :: ug_cellarea(:)  ! fraction of land in the grid cell
+   real, allocatable  :: ug_cellarea(:)  ! grid cell area, m2
    real, allocatable  :: ug_landfrac(:)  ! fraction of land in the grid cell
    real, allocatable  :: ug_lon(:),    ug_lat(:) ! grid center coordinates, radian
    real, allocatable  :: ug_lonb(:,:), ug_latb(:,:) ! grid vertices, radian

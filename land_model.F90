@@ -2006,8 +2006,11 @@ subroutine update_land_model_fast_0d(tile, l, k, land2cplr, &
      if (IS_enabled) then
        if (land2cplr%IS_mask_ug(l,1)>0.) then
 
+         !Fraction of the land area represented by ice sheet
          IS_frac=land2cplr%IS_mask_ug(l,1)*lnd%ug_cellarea(l)/lnd%ug_area(l)
-         ! Do the units make sense here? Is this kg/s per area_glacier?
+
+         ! Do the units make sense here? This is kg/s per area_glacier,
+         ! which we will treat as kg/s per area ice sheet?
          IS_adot = IS_adot + (vegn_fprec + vegn_lprec - snow_lrunf - snow_levap - snow_fevap &
                    - subs_melt - subs_levap - subs_fevap)
 
@@ -3007,7 +3010,7 @@ case(ISTOCK_WATER)
         endif
       if(associated(tile%glac)) then
         call glac_tile_stock_pe(tile%glac, twd_liq_glac, twd_sol_glac)
-        v_IS = v_IS + tile%glac%IS_stock
+        v_IS = v_IS + tile%glac%IS_stock*area_factor
       endif
       if(associated(tile%lake)) &
         call lake_tile_stock_pe(tile%lake, twd_liq_lake, twd_sol_lake)
@@ -3033,11 +3036,11 @@ case(ISTOCK_WATER)
   enddo
   value  = v_cana + v_glac + v_lake + v_soil + v_snow + v_vegn + v_IS
 
-  call mpp_sum(v_IS, pelist=lnd%pelist)
 
   if (debug_adot) then
-     write (message,*) 'IS stock  :',v_IS
-     call error_mesg('lnd',message,NOTE)
+    call mpp_sum(v_IS, pelist=lnd%pelist)
+    write (message,*) 'IS stock  :',v_IS
+    call error_mesg('lnd',message,NOTE)
   endif
 
 a_globe = 4. * pi * radius**2
@@ -3092,12 +3095,13 @@ if (index.eq.ISTOCK_WATER.and.give_stock_details) then
     call mpp_sum(v_soil, pelist=lnd%pelist)
     call mpp_sum(v_snow, pelist=lnd%pelist)
     call mpp_sum(v_vegn, pelist=lnd%pelist)
-    write (message,'(a,f10.5)') 'total land storage:',v_cana/a_globe+v_glac/a_globe+ &
+    if (.not. debug_adot) call mpp_sum(v_IS, pelist=lnd%pelist)
+    write (message,'(a,f10.5)') 'total land storage:',v_cana/a_globe+(v_glac+v_IS)/a_globe+ &
         v_lake/a_globe+v_soil/a_globe+v_snow/a_globe+v_vegn/a_globe+river_value/a_globe
     call error_mesg('Lnd_stock_pe',message,NOTE)
     write (message,'(a,7f10.5)') '...canopy air:',v_cana/a_globe
     call error_mesg('Lnd_stock_pe',message,NOTE)
-    write (message,'(a,7f10.5)') '......glacier:',v_glac/a_globe
+    write (message,'(a,7f10.5)') '......glacier:',(v_glac+v_IS)/a_globe
     call error_mesg('Lnd_stock_pe',message,NOTE)
     write (message,'(a,7f10.5)') '.........lake:',v_lake/a_globe
     call error_mesg('Lnd_stock_pe',message,NOTE)
