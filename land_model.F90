@@ -260,6 +260,7 @@ integer :: &
   id_hlrunf,                id_hlrunfs,  id_hlrunfg,                       &
   id_frunf,                 id_frunfs,                                     &
   id_hfrunf,                id_hfrunfs,                                    &
+  id_isadot,                                                               & 
   id_melt,     id_meltv,    id_melts,    id_meltg,                         &
   id_fsw,      id_fswv,     id_fsws,     id_fswg,                          &
   id_flw,      id_flwv,     id_flws,     id_flwg,                          &
@@ -2233,6 +2234,7 @@ subroutine update_land_model_fast_0d(tile, l, k, land2cplr, &
   ! TODO: generalize diagnostic for runoff of tracers
   if (i_river_DOC /= NO_TRACER) &
         call send_tile_data(id_DOCrunf, subs_tr_runf(i_river_DOC),    tile%diag)
+  call send_tile_data(id_isadot,  IS_adot,                            tile%diag)
   call send_tile_data(id_melt,    vegn_melt+snow_melt+subs_melt,      tile%diag)
   call send_tile_data(id_meltv,   vegn_melt,                          tile%diag)
   call send_tile_data(id_melts,   snow_melt,                          tile%diag)
@@ -3372,6 +3374,8 @@ subroutine land_diag_init(clonb, clatb, clon, clat, time, domain, id_band, id_ug
              'heat of sol snow runoff', 'W/m2', missing_value=-1.0e+20 )
   id_DOCrunf = register_tiled_diag_field ( module_name, 'lrunf_DOC', axes, time, &
              'total rate of DOC runoff', 'kgC/(m2 s)', missing_value=-1.0e+20 )
+  id_isadot = register_tiled_diag_field ( module_name, 'is_adot', axes, time, &
+             'Ice sheet top mass flux per glacier area', 'kg/(m2 s)', missing_value=-1.0e+20 )
   id_melt    = register_tiled_diag_field ( module_name, 'melt', axes, time, &
              'total rate of melt', 'kg/(m2 s)', missing_value=-1.0e+20 )
   id_meltv   = register_tiled_diag_field ( module_name, 'meltv', axes, time, &
